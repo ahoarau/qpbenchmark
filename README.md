@@ -125,6 +125,56 @@ To generate the following plot:
 
 ![image](https://user-images.githubusercontent.com/1189580/220150365-530cd685-fc90-49b5-90e0-0b243fa602d9.png)
 
+## Parallel execution
+
+The `run` command distributes QP solver calls across multiple CPU cores. The implementation has three sequential phases, all orchestrated from the main process:
+
+### Phase 1 – Load problems
+
+All problems in the test set are loaded into memory on the main process. The total number of tasks (`problems × solvers × settings`) is computed and a progress bar is initialized.
+
+### Phase 2 – Triage (main process, no workers spawned)
+
+Every `(problem, solver, settings)` combination is inspected on the main process. Tasks that do not require a solver call are handled immediately:
+
+| Action | Condition | What happens |
+|--------|-----------|--------------|
+| **skip** | Result already in CSV and `--rerun` is not set | Logged at DEBUG, progress bar advances |
+| **skip_timeout** | Result is a timeout and `--rerun-timeouts` is not set | Logged at INFO, progress bar advances |
+| **record_failure** | Known solver issue or known solver timeout | Recorded with runtime = 0, persisted in one batch |
+| **solve** | Everything else | Added to the solve queue for Phase 3 |
+
+This phase is fast (pure Python, no I/O beyond reading the existing CSV) and means the progress bar already reflects all previously solved problems before any solver is invoked.
+
+### Phase 3 – Process pool (solve tasks only)
+
+A `ProcessPoolExecutor` with `max_workers` worker processes is created. By default `max_workers` equals the number of **physical CPU cores** (not logical/hyperthreaded cores, as detected via `psutil`). Each worker process runs one solve task at a time:
+
+1. Registers its PID in a shared `active_tasks` dict (a `multiprocessing.Manager` proxy, used for the progress-bar description).
+2. Calls the QP solver via `time_solve_problem(problem, solver, **kwargs)`.
+3. Returns `(solution, runtime, success)` via the `Future`.
+
+The **main process** drives the collection loop:
+- Waits on `concurrent.futures.wait(..., timeout=0.5)` for any future to complete.
+- When one finishes: persists the result to CSV via `results.write()`, advances the progress bar, and logs the outcome (`Solved / Failed … in Xs`).
+- Every `STATUS_INTERVAL` seconds (default 4 s): logs a one-line summary of how many tasks are done and what each active worker is currently solving.
+- On `SIGINT` (Ctrl-C): sets a `stop_event` flag, cancels pending futures, and waits for running solves to finish before exiting.
+
+### Process count and solver thread limits
+
+To prevent a **thread explosion** inside worker processes, two complementary controls are applied:
+
+1. **Environment variables** (`OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, `RAYON_NUM_THREADS`, …) are set to `1` at process start, before any solver library is imported, so their internal thread pools are initialized single-threaded.
+2. **Solver-level parameters** (`Threads`, `MSK_IPAR_NUM_THREADS`, `threads`, `max_threads`, …) are set to `1` for solvers that support a runtime thread-count flag (Gurobi, MOSEK, HiGHS, Clarabel).
+
+The result is that each worker process runs exactly one solver call at a time, single-threaded internally, giving `max_workers` truly independent solver calls in parallel with no GIL contention.
+
+To run sequentially (useful for timing comparisons or debugging), pass `--max-workers 1`:
+
+```console
+qpbenchmark my_test_set.py run --max-workers 1
+```
+
 ## Contributing
 
 Contributions to improving this benchmark are welcome. You can for instance propose new problems, or share the runtimes you obtain on your machine. Check out the [contribution guidelines](CONTRIBUTING.md) for details.
