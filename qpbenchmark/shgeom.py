@@ -33,6 +33,8 @@ def shgeom(v: np.ndarray, sh: float) -> float:
         arithmetic means) nor by very small outliers (in contrast to geometric
         means)."
     """
+    if len(v) == 0:
+        return float("nan")
     if (v < 0.0).any():
         raise BenchmarkError(
             "Cannot compute shifted geometric mean, "
