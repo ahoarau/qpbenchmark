@@ -16,6 +16,22 @@ from importlib import import_module  # type: ignore
 from pathlib import Path
 from typing import Optional, Union
 
+# Set thread-limiting environment variables BEFORE importing solver libraries.
+# OpenBLAS, MKL, Rayon and other math backends initialize their thread pools
+# at library load time and only respect these vars if set before import.
+_THREAD_ENV_VARS = {
+    "OMP_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "BLIS_NUM_THREADS": "1",
+    "VECLIB_MAXIMUM_THREADS": "1",
+    "RAYON_NUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS": "1",
+}
+for _var, _val in _THREAD_ENV_VARS.items():
+    if _var not in os.environ:  # don't override user-set values
+        os.environ[_var] = _val
+
 import qpsolvers
 
 from .exceptions import BenchmarkError
@@ -129,7 +145,7 @@ def parse_command_line_arguments(
     )
     parser_report.add_argument(
         "--author",
-        help="author field in the report",
+        help="author field in the report (default: 'qpbenchmark-user')",
     )
 
     # run
@@ -164,7 +180,13 @@ def parse_command_line_arguments(
     )
     parser_run.add_argument(
         "--author",
-        help="author field in the post-run report",
+        help="author field in the post-run report (default: 'qpbenchmark-user')",
+    )
+    parser_run.add_argument(
+        "--max-workers",
+        help="maximum number of parallel worker processes (default: auto-detect CPU count)",
+        type=int,
+        default=None,
     )
 
     args = parser.parse_args()
@@ -208,11 +230,16 @@ def report(args, results: Results, test_set_path: Union[Path, str]):
         test_set_path: Path to the test set Python source.
     """
     logging.info("Writing the overall report...")
-    author = (
-        args.author
-        if args.author
-        else input("GitHub username to write in the report? ")
-    )
+
+    if args.author:
+        author = args.author
+    else:
+        author = "qpbenchmark-user"
+        logging.info(
+            "Using default author 'qpbenchmark-user'. "
+            "Use --author <name> to set a custom author name."
+        )
+
     report = Report(author, results)
     if results.file_path is None:
         raise BenchmarkError("not sure where to save report: no results file")
@@ -246,7 +273,19 @@ def main(
     if args.very_verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     test_set = load_test_set(os.path.abspath(test_set_path))
-    results = Results(results_path or args.results_path, test_set)
+
+    # Set default results path if not provided
+    effective_results_path = results_path or args.results_path
+    if effective_results_path is None:
+        # Create default path: results/<test_set_name>.csv
+        test_set_name = Path(test_set_path).stem
+        test_set_dir = Path(test_set_path).parent
+        results_dir = test_set_dir / "results"
+        results_dir.mkdir(exist_ok=True)
+        effective_results_path = results_dir / f"{test_set_name}.csv"
+        logging.info(f"Using default results file: {effective_results_path}")
+
+    results = Results(effective_results_path, test_set)
 
     if args.command == "run":
         run(
@@ -258,6 +297,7 @@ def main(
             rerun=args.rerun,
             rerun_timeouts=args.rerun_timeouts,
             verbose=args.verbose,
+            max_workers=args.max_workers,
         )
 
     if args.command == "check_problem":
