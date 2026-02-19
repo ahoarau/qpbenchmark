@@ -183,6 +183,12 @@ def parse_command_line_arguments(
         help="author field in the post-run report (default: 'qpbenchmark-user')",
     )
     parser_run.add_argument(
+        "--limit",
+        help="limit the number of problems to solve (0 means no limit)",
+        type=int,
+        default=0,
+    )
+    parser_run.add_argument(
         "--max-workers",
         help="maximum number of parallel worker processes (default: auto-detect CPU count)",
         type=int,
@@ -273,6 +279,9 @@ def main(
     if args.very_verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     test_set = load_test_set(os.path.abspath(test_set_path))
+
+    if args.command == "run" and args.limit:
+        test_set.limit = args.limit
 
     # Set default results path if not provided
     effective_results_path = results_path or args.results_path
