@@ -7,11 +7,10 @@
 """Main function of the benchmark."""
 
 import multiprocessing
-import multiprocessing.managers
 import os
 import signal
 from time import perf_counter, sleep
-from typing import Optional
+from typing import List, Optional
 
 import qpsolvers
 from qpsolvers.exceptions import SolverNotFound
@@ -21,6 +20,16 @@ from .results import Results
 from .spdlog import logging
 from .test_set import TestSet
 from .utils import time_solve_problem
+
+
+def _format_runtime(seconds: float) -> str:
+    """Format a runtime duration with an appropriate unit."""
+    if seconds < 1e-3:
+        return f"{seconds * 1e6:.1f}µs"
+    elif seconds < 1.0:
+        return f"{seconds * 1e3:.1f}ms"
+    else:
+        return f"{seconds:.2f}s"
 
 
 def _get_physical_cpu_count() -> int:
@@ -199,10 +208,8 @@ def _solve_task(
     problem,
     solver: str,
     settings: str,
-    test_set,
+    solver_kwargs: dict,
     verbose: bool,
-    active_tasks,
-    active_tasks_lock,
 ):
     """Execute a single QP solve.  Called from a process-pool worker.
 
@@ -210,21 +217,13 @@ def _solve_task(
         problem: The QP problem to solve.
         solver: Name of the QP solver.
         settings: Name of the solver settings.
-        test_set: The test set (carries solver_settings dicts).
+        solver_kwargs: Keyword arguments for the solver.
         verbose: If True, log before each solve.
-        active_tasks: Shared dict (multiprocessing.managers.DictProxy) for
-            progress-bar introspection.
-        active_tasks_lock: Lock (multiprocessing.managers.AcquirerProxy)
-            protecting *active_tasks*.
 
     Returns:
         Tuple ``(solution, runtime, success)``.
     """
-    worker_id = str(os.getpid())
-    label = f"{problem.name}/{solver}/{settings}"
-
-    with active_tasks_lock:
-        active_tasks[worker_id] = label
+    logging.debug(f"Worker {os.getpid()} started: {problem.name}/{solver}/{settings}")
 
     if verbose:
         logging.info(
@@ -232,10 +231,9 @@ def _solve_task(
             f"with {settings} settings..."
         )
 
-    kwargs = test_set.solver_settings[settings][solver]
     try:
         solution, runtime = time_solve_problem(
-            problem, solver, **kwargs
+            problem, solver, **solver_kwargs
         )
         # Compute residuals here while the full Solution is still available,
         # then discard the heavyweight object so only plain scalars cross the
@@ -260,9 +258,6 @@ def _solve_task(
         )
         runtime = 0.0
         success = False
-    finally:
-        with active_tasks_lock:
-            active_tasks.pop(worker_id, None)
 
     return proxy, runtime, success
 
@@ -339,6 +334,21 @@ def run(
     # Display system information
     _display_system_info(max_workers)
 
+    # ------------------------------------------------------------------
+    # Install signal handler early so CTRL+C during Phase 1/2 is clean.
+    # pool_cell[0] is populated once the pool is created in Phase 3.
+    # ------------------------------------------------------------------
+    stop_event = multiprocessing.Event()
+    pool_cell: List = []  # mutable cell so signal handler can reach the pool
+
+    def signal_handler(signum, frame):
+        logging.warning("Received interrupt signal (CTRL+C), stopping...")
+        stop_event.set()
+        if pool_cell:
+            pool_cell[0].terminate()
+
+    original_sigint = signal.signal(signal.SIGINT, signal_handler)
+
     # Filter solvers and settings based on user preferences
     filtered_solvers = [
         solver
@@ -370,11 +380,14 @@ def run(
     # Phase 1 – Load problems (main thread)
     # ------------------------------------------------------------------
     logging.info("Loading problems from test set...")
-    problems = [
-        problem
-        for problem in test_set
-        if only_problem is None or problem.name == only_problem
-    ]
+    problems = []
+    for problem in test_set:
+        if stop_event.is_set():
+            logging.warning("Interrupted during problem loading.")
+            signal.signal(signal.SIGINT, original_sigint)
+            return
+        if only_problem is None or problem.name == only_problem:
+            problems.append(problem)
     nb_total = len(problems) * len(filtered_solvers) * len(filtered_settings)
     logging.info(
         f"Loaded {len(problems)} problems, "
@@ -409,18 +422,31 @@ def run(
     nb_skip_timeout = 0
     nb_record_failure = 0
 
+    # Optimization: Pre-load existing results for O(1) lookup
+    existing_results = {
+        (row.problem, row.solver, row.settings): row.runtime
+        for row in results.df.itertuples(index=False)
+    }
+
     for problem in problems:
+        if stop_event.is_set():
+            logging.warning("Interrupted during task triage.")
+            signal.signal(signal.SIGINT, original_sigint)
+            return
         for solver in filtered_solvers:
             for settings in filtered_settings:
                 time_limit = test_set.tolerances[settings].runtime
+                key = (problem.name, solver, settings)
 
-                if results.has(problem, solver, settings):
+                if key in existing_results:
                     if not rerun:
                         action = "skip"
-                    elif not rerun_timeouts and results.is_timeout(
-                        problem, solver, settings, time_limit
-                    ):
-                        action = "skip_timeout"
+                    elif not rerun_timeouts:
+                        runtime = existing_results[key]
+                        if runtime > 0.99 * time_limit:
+                            action = "skip_timeout"
+                        else:
+                            action = "solve"
                     else:
                         action = "solve"
                 elif test_set.skip_solver_issue(problem, solver):
@@ -489,29 +515,15 @@ def run(
     # ------------------------------------------------------------------
     # Phase 3 – Solve in a process pool (true multiprocessing parallelism)
     # ------------------------------------------------------------------
-    # Shared dict for real-time introspection: pid string -> active label.
-    # Written by pool workers (via Manager proxy), read by the main process
-    # for the progress bar.
-    manager = multiprocessing.Manager()
-    active_tasks = manager.dict()
-    active_tasks_lock = manager.Lock()
-    stop_event = multiprocessing.Event()
-
-    # Pool is created here so the signal handler can call pool.terminate().
     # _worker_init re-applies BLAS thread limits after fork.
     pool = multiprocessing.Pool(processes=max_workers, initializer=_worker_init)
+    pool_cell.append(pool)  # expose to signal handler
 
-    STATUS_INTERVAL = 4.0  # seconds between periodic status logs
+    STATUS_INTERVAL = 4.0   # seconds between periodic status logs
+    WRITE_INTERVAL = 30.0    # seconds between results flushes to disk
     last_status_time = perf_counter()
-
-    def signal_handler(signum, frame):
-        logging.warning("Received interrupt signal (CTRL+C), stopping...")
-        stop_event.set()
-        # Kill all running worker processes immediately – don't wait for the
-        # current solver call to finish.
-        pool.terminate()
-
-    original_sigint = signal.signal(signal.SIGINT, signal_handler)
+    last_write_time = perf_counter()
+    unsaved_results = 0
 
     logging.info(
         f"Launching process pool with {max_workers} workers "
@@ -528,10 +540,8 @@ def run(
                         problem,
                         solver,
                         settings,
-                        test_set,
+                        test_set.solver_settings[settings][solver],
                         verbose,
-                        active_tasks,
-                        active_tasks_lock,
                     ),
                 ),
                 problem,
@@ -574,13 +584,17 @@ def run(
                 logging.info(
                     f"{'Solved' if success else 'Failed'} "
                     f"{problem.name} / {solver} / {settings} "
-                    f"in {runtime:.2f}s "
+                    f"in {_format_runtime(runtime)} "
                     f"(found={solution.found})"
                 )
                 results.update(
                     problem, solver, settings, solution, runtime
                 )
-                results.write()
+                unsaved_results += 1
+                if perf_counter() - last_write_time >= WRITE_INTERVAL:
+                    results.write()
+                    last_write_time = perf_counter()
+                    unsaved_results = 0
                 if progress_bar is not None:
                     progress_bar.update(1)
 
@@ -589,23 +603,12 @@ def run(
             # Periodic status log
             now = perf_counter()
             if now - last_status_time >= STATUS_INTERVAL:
-                snap = active_tasks.copy()
-                n_active = len(snap)
-                if n_active > 0:
-                    labels = [
-                        label
-                        for _, label in sorted(snap.items())
-                    ]
+                n_done = len(solve_tasks) - len(still_pending)
+                n_in_flight = len(still_pending)
+                if n_in_flight > 0:
                     logging.info(
-                        f"Progress: {len(solve_tasks) - len(still_pending) - len(newly_done)}/"
-                        f"{len(solve_tasks)} solves done, "
-                        f"{n_active} workers active: "
-                        + ", ".join(labels[:4])
-                        + (
-                            f" (+{n_active - 4} more)"
-                            if n_active > 4
-                            else ""
-                        )
+                        f"Progress: {n_done}/{len(solve_tasks)} solves done, "
+                        f"{n_in_flight} in flight"
                     )
                 last_status_time = now
 
@@ -616,11 +619,9 @@ def run(
             if not newly_done:
                 sleep(0.05)
 
-        if not stop_event.is_set():
-            pool.join()
-        else:
-            # terminate() was already called by the signal handler; just reap.
-            pool.join()
+        pool.terminate() if stop_event.is_set() else pool.close()
+        # Wait up to 5 s for workers to exit, then SIGKILL stragglers.
+        pool.join()
 
     except KeyboardInterrupt:
         # Shouldn't normally reach here (signal handler fires first),
@@ -634,10 +635,9 @@ def run(
         signal.signal(signal.SIGINT, original_sigint)
         if progress_bar is not None:
             progress_bar.close()
-        manager.shutdown()
 
     # Final safety-net write
-    if nb_calls > 0 or stop_event.is_set():
+    if unsaved_results > 0 or stop_event.is_set():
         logging.info("Writing final results to disk...")
         results.write()
 
