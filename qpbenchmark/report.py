@@ -263,8 +263,7 @@ class Report:
             else ""
         )
         date = str(datetime.datetime.now(datetime.timezone.utc))
-        fh.write(
-            f"""# {self.test_set.title}
+        fh.write(f"""# {self.test_set.title}
 
 | Number of problems | {nb_problems} |
 |:-------------------|:--------------------|
@@ -273,8 +272,7 @@ class Report:
 | CPU                | [{cpu_info_summary}](#cpu-info) |{optional_gpu_line}
 | Run by             | [@{self.author}](https://github.com/{self.author}/) |
 
-"""
-        )
+""")
         fh.write(
             "Benchmark reports are copious as we aim to document "
             "comparison factors as much as possible. You can also "
@@ -290,17 +288,14 @@ class Report:
         fh.write("## Contents\n\n")
         if self.test_set.description is not None:
             fh.write("* [Description](#description)\n")
-        fh.write(
-            """* [Solvers](#solvers)
-* [Results by settings](#results-by-settings)\n"""
-        )
+        fh.write("""* [Solvers](#solvers)
+* [Results by settings](#results-by-settings)\n""")
         for name in self.solver_settings:
             sec_id = name.replace("_", "-") + "-settings"
             fh.write(
                 f"    * [{capitalize_settings(name)} settings](#{sec_id})\n"
             )
-        fh.write(
-            """* [Results by metric](#results-by-metric)
+        fh.write("""* [Results by metric](#results-by-metric)
     * [Success rate](#success-rate)
     * [Computation time](#computation-time)
     * [Optimality conditions](#optimality-conditions)
@@ -309,8 +304,7 @@ class Report:
         * [Duality gap](#duality-gap)
 * [Settings](#settings)
 * [Known limitations](#known-limitations)
-* [CPU info](#cpu-info)\n\n"""
-        )
+* [CPU info](#cpu-info)\n\n""")
 
     def __write_description(self, fh: io.TextIOWrapper) -> None:
         """Write optional Description section.
@@ -354,7 +348,7 @@ class Report:
         fh.write("## Settings\n\n")
         fh.write(
             f"There are {len(italics_settings)} settings: "
-            f'{", ".join(italics_settings[:-1])} '
+            f"{', '.join(italics_settings[:-1])} "
             f"and {italics_settings[-1]}. "
             "They validate solutions using the following tolerances:\n\n"
         )
@@ -416,7 +410,7 @@ class Report:
             )
             fh.write(f"### {capitalize_settings(settings)} settings\n\n")
             fh.write(f"{shm_desc}\n\n")
-            fh.write(f'{df.to_markdown(index=True, floatfmt=".1f")}\n\n')
+            fh.write(f"{df.to_markdown(index=True, floatfmt='.1f')}\n\n")
 
     def __write_results_by_metric(self, fh: io.TextIOWrapper) -> None:
         """Write Results by metric.
@@ -474,7 +468,7 @@ class Report:
             "(1.0 is the best):\n\n"
         )
         fh.write(
-            f'{self.__runtime_df.to_markdown(index=True, floatfmt=".1f")}\n\n'
+            f"{self.__runtime_df.to_markdown(index=True, floatfmt='.1f')}\n\n"
         )
 
         comp_times_table_desc = (
@@ -505,7 +499,7 @@ class Report:
             "(1.0 is the best):\n\n"
         )
         fh.write(
-            f'{self.__primal_df.to_markdown(index=True, floatfmt=".1f")}\n\n'
+            f"{self.__primal_df.to_markdown(index=True, floatfmt='.1f')}\n\n"
         )
 
         primal_residual_table_desc = (
@@ -531,11 +525,10 @@ class Report:
 
         fh.write(f"{dual_residual_shm_desc}\n\n")
         fh.write(
-            "Shifted geometric means of dual residuals "
-            "(1.0 is the best):\n\n"
+            "Shifted geometric means of dual residuals (1.0 is the best):\n\n"
         )
         fh.write(
-            f'{self.__dual_df.to_markdown(index=True, floatfmt=".1f")}\n\n'
+            f"{self.__dual_df.to_markdown(index=True, floatfmt='.1f')}\n\n"
         )
 
         dual_residual_table_desc = (
@@ -563,10 +556,10 @@ class Report:
 
         fh.write(f"{duality_gap_shm_desc}\n\n")
         fh.write(
-            "Shifted geometric means of duality gaps " "(1.0 is the best):\n\n"
+            "Shifted geometric means of duality gaps (1.0 is the best):\n\n"
         )
         fh.write(
-            f'{self.__gap_df.to_markdown(index=True, floatfmt=".1f")}\n\n'
+            f"{self.__gap_df.to_markdown(index=True, floatfmt='.1f')}\n\n"
         )
 
         duality_gap_table_desc = (

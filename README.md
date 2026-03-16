@@ -125,6 +125,55 @@ To generate the following plot:
 
 ![image](https://user-images.githubusercontent.com/1189580/220150365-530cd685-fc90-49b5-90e0-0b243fa602d9.png)
 
+## Parallel execution
+
+The `run` command distributes QP solver calls across multiple CPU cores. To scale to test sets containing millions of problems without running out of memory, the main process streams problems and solves them in parallel:
+
+### Phase 1 – Problem streaming and initialization
+
+The total number of tasks (`problems × solvers × settings`) is computed to initialize the progress bar. Unlike earlier versions, problems are **not** loaded into memory all at once.
+
+### Phase 2 & 3 – Streaming Triage and Process Pool
+
+A `multiprocessing.Pool` with `max_workers` worker processes is created. By default `max_workers` equals the number of **physical CPU cores** (not logical/hyperthreaded cores, as detected via `psutil`). 
+
+The main thread uses a generator to lazily yield problems one by one from the test set. For every `(problem, solver, settings)` combination, the task is triaged:
+
+| Action | Condition | What happens |
+|--------|-----------|--------------|
+| **skip** | Result already in CSV and `--rerun` is not set | Logged at DEBUG, progress bar advances |
+| **skip_timeout** | Result is a timeout and `--rerun-timeouts` is not set | Logged at INFO, progress bar advances |
+| **record_failure** | Known solver issue or known solver timeout | Recorded with runtime = 0, persisted in the next batch |
+| **solve** | Everything else | Added to the bounded solve queue for workers |
+
+To maintain a strict memory limit, the main thread ensures there are never more than `max_workers * 2` solve tasks queued at the same time. Each worker process runs one solve task at a time:
+
+1. Calls the QP solver via `time_solve_problem(problem, solver, **kwargs)`.
+2. Computes the residuals natively to avoid pickling heavy `Solution` objects.
+3. Returns `(proxy_solution, runtime, success)` asynchronously.
+
+The **main process** drives the collection loop:
+- Enqueues new problems only when the active queue falls below its limit.
+- Waits on `AsyncResult.ready()` to collect finished tasks.
+- Periodically persists results to CSV via `results.write()` (every 30 seconds).
+- Drops references to the `problem` object immediately after dispatching to workers, allowing Python's garbage collector to free the matrices from memory.
+- On `SIGINT` (Ctrl-C): sets a `stop_event` flag, cancels pending futures, and waits for running solves to finish before gracefully exiting.
+
+### Process count and solver thread limits
+
+To prevent a **thread explosion** inside worker processes, two complementary controls are applied:
+
+1. **Environment variables** (`OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, `RAYON_NUM_THREADS`, …) are set to `1` at process start, before any solver library is imported, so their internal thread pools are initialized single-threaded.
+2. **Solver-level parameters** (`Threads`, `MSK_IPAR_NUM_THREADS`, `threads`, `max_threads`, …) are set to `1` for solvers that support a runtime thread-count flag (Gurobi, MOSEK, HiGHS, Clarabel).
+
+The result is that each worker process runs exactly one solver call at a time, single-threaded internally, giving `max_workers` truly independent solver calls in parallel with no GIL contention.
+
+To run sequentially (useful for timing comparisons or debugging), pass `--max-workers 1`:
+
+```console
+qpbenchmark my_test_set.py run --max-workers 1
+```
+
 ## Contributing
 
 Contributions to improving this benchmark are welcome. You can for instance propose new problems, or share the runtimes you obtain on your machine. Check out the [contribution guidelines](CONTRIBUTING.md) for details.

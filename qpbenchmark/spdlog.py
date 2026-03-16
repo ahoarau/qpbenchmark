@@ -11,7 +11,43 @@ with formatting similar to spdlog.
 """
 
 import logging
+import warnings
 from typing import Any, Dict
+
+import tqdm as tqdm_module
+
+
+def _warning_handler(
+    message, category, filename, lineno, file=None, line=None
+):
+    """Custom warning handler that writes through tqdm.write()."""
+    msg = warnings.formatwarning(message, category, filename, lineno, line)
+    tqdm_module.tqdm.write(msg.rstrip())
+
+
+# Redirect warnings through tqdm to avoid interfering with progress bars
+warnings.showwarning = _warning_handler
+
+
+class TqdmLoggingHandler(logging.Handler):
+    """Custom logging handler that writes through tqdm.write().
+
+    This prevents log messages from interfering with tqdm progress bars.
+    """
+
+    def __init__(self, level=logging.NOTSET):
+        """Initialize the handler with a given level."""
+        super().__init__(level)
+        self.formatter = SpdlogFormatter()
+
+    def emit(self, record):
+        """Emit a log record."""
+        try:
+            msg = self.format(record)
+            tqdm_module.tqdm.write(msg)
+            self.flush()
+        except Exception:
+            self.handleError(record)
 
 
 class SpdlogFormatter(logging.Formatter):
@@ -48,15 +84,20 @@ class SpdlogFormatter(logging.Formatter):
         return formatter.format(record)
 
 
+# Initialize logger with TqdmLoggingHandler for clean progress bar output
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
-handler = logging.StreamHandler()
+
+# Remove any existing handlers to avoid duplicate logs
+logger.handlers.clear()
+
+# Add our tqdm-aware handler
+handler = TqdmLoggingHandler()
 handler.setLevel(logging.DEBUG)
-handler.setFormatter(SpdlogFormatter())
 logger.addHandler(handler)
-logging.basicConfig(level=logging.INFO)
 
 
 __all__ = [
     "logging",
+    "TqdmLoggingHandler",
 ]

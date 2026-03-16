@@ -32,6 +32,7 @@ class TestSet(abc.ABC):
     known_solver_timeouts: Dict[Tuple[str, str, str], float]
     solver_settings: Dict[str, SolverSettings]
     tolerances: Dict[str, Tolerance]
+    limit: Optional[int] = None
 
     @abc.abstractmethod
     def __iter__(self) -> Iterator[Problem]:

@@ -32,6 +32,7 @@ class Results:
     df: pandas.DataFrame
     file_path: Optional[Path]
     test_set: TestSet
+    __new_results: list
 
     @staticmethod
     def check_df(df) -> None:
@@ -56,10 +57,16 @@ class Results:
         file_path = Path(path)
         if not file_path.exists():
             return None
+        elif file_path.stat().st_size == 0:
+            logging.warning(
+                "Results file '%s' is empty, treating as if it "
+                "does not exist.",
+                file_path,
+            )
+            return None
         elif file_path.suffix not in (".csv", ".parquet"):
             raise BenchmarkError(
-                "unknown file extension to read results from "
-                f"in '{file_path}'"
+                f"unknown file extension to read results from in '{file_path}'"
             )
         logging.info("Loading existing results from '%s'...", file_path)
         read_func = (
@@ -117,6 +124,7 @@ class Results:
         complementary_df = df[~df["problem"].isin(problems)]
 
         self.__complementary_df = complementary_df
+        self.__new_results: list = []
         self.df = test_set_df
         self.file_path = Path(file_path) if file_path is not None else None
         self.test_set = test_set
@@ -124,7 +132,7 @@ class Results:
     @property
     def nb_rows(self) -> int:
         """Number of rows in the dataframe."""
-        return self.df.shape[0]
+        return self.df.shape[0] + len(self.__new_results)
 
     def write(self, path: Optional[Union[str, Path]] = None) -> None:
         """Write results to their CSV file for persistence.
@@ -135,6 +143,7 @@ class Results:
         path_check = path or self.file_path
         if path_check is None:
             raise BenchmarkError("no path to save results to")
+        self.__merge_new_results()
         save_path = Path(path_check)
         save_df = pandas.concat([self.df, self.__complementary_df])
         save_df = save_df.sort_values(by=["problem", "solver", "settings"])
@@ -163,6 +172,7 @@ class Results:
         Returns:
             True if a result for this instance is present.
         """
+        self.__merge_new_results()
         return (
             (self.df["problem"] == problem.name)
             & (self.df["solver"] == solver)
@@ -173,6 +183,7 @@ class Results:
         self, problem: Problem, solver: str, settings: str, time_limit: float
     ) -> bool:
         """Check whether a particular result was a timeout."""
+        self.__merge_new_results()
         runtime = self.df[
             (self.df["problem"] == problem.name)
             & (self.df["solver"] == solver)
@@ -180,48 +191,66 @@ class Results:
         ]["runtime"].iat[0]
         return runtime > 0.99 * time_limit
 
+    def __merge_new_results(self) -> None:
+        if not self.__new_results:
+            return
+        new_df = pandas.DataFrame(self.__new_results)
+        self.df = pandas.concat([self.df, new_df], ignore_index=True)
+        self.df = self.df.drop_duplicates(
+            subset=["problem", "solver", "settings"], keep="last"
+        )
+        self.__new_results = []
+
     def update(
         self,
-        problem: Problem,
+        problem: Union[Problem, str],
         solver: str,
         settings: str,
-        solution: qpsolvers.Solution,
-        runtime: float,
+        solution: Optional[qpsolvers.Solution] = None,
+        runtime: float = 0.0,
+        *,
+        found: Optional[bool] = None,
+        primal_residual: Optional[float] = None,
+        dual_residual: Optional[float] = None,
+        duality_gap: Optional[float] = None,
     ) -> None:
         """Update entry for a given (problem, solver) pair.
 
         Args:
-            problem: Problem solved.
+            problem: Problem solved or problem name.
             solver: Solver name.
             settings: Solver settings.
-            solution: Solution found by the solver.
+            solution: Solution found by the solver (optional).
             runtime: Duration the solver took, in seconds.
+            found: Whether the solver found a solution.
+            primal_residual: Primal residual of the solution.
+            dual_residual: Dual residual of the solution.
+            duality_gap: Duality gap of the solution.
         """
-        self.df = self.df.drop(
-            self.df.index[
-                (self.df["problem"] == problem.name)
-                & (self.df["solver"] == solver)
-                & (self.df["settings"] == settings)
-            ]
-        )
-        found: bool = True if solution.found else False  # make sure not None
-        self.df = pandas.concat(
-            [
-                self.df,
-                pandas.DataFrame(
-                    {
-                        "problem": [problem.name],
-                        "solver": [solver],
-                        "settings": [settings],
-                        "runtime": [runtime],
-                        "found": [found],
-                        "primal_residual": [solution.primal_residual()],
-                        "dual_residual": [solution.dual_residual()],
-                        "duality_gap": [solution.duality_gap()],
-                    }
-                ),
-            ],
-            ignore_index=True,
+        problem_name = problem if isinstance(problem, str) else problem.name
+
+        if solution is not None:
+            found_val: Optional[bool] = solution.found
+            primal_res_val: Optional[float] = solution.primal_residual()
+            dual_res_val: Optional[float] = solution.dual_residual()
+            gap_val: Optional[float] = solution.duality_gap()
+        else:
+            found_val = found
+            primal_res_val = primal_residual
+            dual_res_val = dual_residual
+            gap_val = duality_gap
+
+        self.__new_results.append(
+            {
+                "problem": problem_name,
+                "solver": solver,
+                "settings": settings,
+                "runtime": runtime,
+                "found": True if found_val else False,
+                "primal_residual": primal_res_val,
+                "dual_residual": dual_res_val,
+                "duality_gap": gap_val,
+            }
         )
 
     def build_success_rate_df(
@@ -240,6 +269,7 @@ class Results:
         Returns:
             Success-rate data frames.
         """
+        self.__merge_new_results()
         solvers = set(self.df["solver"].to_list())
         all_settings = set(self.df["settings"].to_list())
         df = self.df.fillna(value=np.nan)  # replace None by NaN for abs()
@@ -287,6 +317,7 @@ class Results:
         Returns:
             Correctness-rate data frames.
         """
+        self.__merge_new_results()
         solvers = set(self.df["solver"].to_list())
         all_settings = set(self.df["settings"].to_list())
         df = self.df.fillna(value=np.nan)  # replace None by NaN for abs()
@@ -343,6 +374,7 @@ class Results:
         Returns:
             Dictionary with the shifted geometric mean of each solver.
         """
+        self.__merge_new_results()
         solvers = set(self.df["solver"].to_list())
         means = {}
         for solver in solvers:

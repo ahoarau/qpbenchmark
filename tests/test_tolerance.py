@@ -8,7 +8,7 @@
 
 import unittest
 
-from qpbenchmark import Tolerance, BenchmarkError
+from qpbenchmark import BenchmarkError, Tolerance
 
 
 class TestTolerance(unittest.TestCase):
