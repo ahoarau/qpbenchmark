@@ -165,10 +165,11 @@ def time_solve_problem(
     return solution, runtime
 
 
-def is_posdef(M: np.ndarray) -> bool:
+def is_posdef(M: np.ndarray, tol: float = 1e-14) -> bool:
     """Test whether a matrix is positive-definite.
 
     Args:
         M: Matrix to test.
+        tol: Threshold for when eigenvalues are considered nonzero
     """
-    return all(np.linalg.eigvals(M) > 0)
+    return all(np.linalg.eigvals(M) > tol)
