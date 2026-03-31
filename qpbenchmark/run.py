@@ -19,6 +19,76 @@ from .test_set import TestSet
 from .utils import time_solve_problem
 
 
+def check_problems(
+    test_set: TestSet,
+    results: Results,
+    filtered_solvers: list,
+    filtered_settings: list,
+    only_problem: Optional[str],
+    rerun: bool,
+    rerun_timeouts: bool,
+    progress_bar: Optional[tqdm],
+):
+    """Check which problems need to be computed and yield tasks."""
+    for problem in test_set:
+        if only_problem and problem.name != only_problem:
+            continue
+        tasks = []
+        for solver in filtered_solvers:
+            for settings in filtered_settings:
+                time_limit = test_set.tolerances[settings].runtime
+                if results.has(problem, solver, settings):
+                    if not rerun:
+                        logging.debug(
+                            f"{problem.name} already solved by {solver} "
+                            f"with {settings} settings..."
+                        )
+                        if progress_bar is not None:
+                            # We don't count existing results beforehand
+                            progress_bar.update(1)
+                        continue
+                    if not rerun_timeouts and results.is_timeout(
+                        problem, solver, settings, time_limit
+                    ):
+                        logging.info(
+                            f"Skipping {problem.name} with {solver} and "
+                            f"{settings} settings as a previous timeout..."
+                        )
+                        if progress_bar is not None:
+                            # We don't count existing results beforehand
+                            progress_bar.update(1)
+                        continue
+                if test_set.skip_solver_issue(problem, solver):
+                    failure = (
+                        problem,
+                        solver,
+                        settings,
+                        qpsolvers.Solution(problem),
+                        0.0,
+                    )
+                    results.update(*failure)
+                    if progress_bar is not None:
+                        progress_bar.update(1)
+                    continue
+                if test_set.skip_solver_timeout(
+                    time_limit, problem, solver, settings
+                ):
+                    failure = (
+                        problem,
+                        solver,
+                        settings,
+                        qpsolvers.Solution(problem),
+                        0.0,
+                    )
+                    results.update(*failure)
+                    if progress_bar is not None:
+                        progress_bar.update(1)
+                    continue
+                tasks.append((solver, settings))
+        if tasks:
+            yield problem, tasks
+
+
 def run(
     test_set: TestSet,
     results: Results,
@@ -78,79 +148,40 @@ def run(
             initial=0,
         )
 
-    for problem in test_set:
-        if only_problem and problem.name != only_problem:
-            continue
-        for solver in filtered_solvers:
-            for settings in filtered_settings:
-                time_limit = test_set.tolerances[settings].runtime
-                if results.has(problem, solver, settings):
-                    if not rerun:
-                        logging.debug(
-                            f"{problem.name} already solved by {solver} "
-                            f"with {settings} settings..."
-                        )
-                        if progress_bar is not None:
-                            # We don't count existing results beforehand
-                            progress_bar.update(1)
-                        continue
-                    if not rerun_timeouts and results.is_timeout(
-                        problem, solver, settings, time_limit
-                    ):
-                        logging.info(
-                            f"Skipping {problem.name} with {solver} and "
-                            f"{settings} settings as a previous timeout..."
-                        )
-                        if progress_bar is not None:
-                            # We don't count existing results beforehand
-                            progress_bar.update(1)
-                        continue
-                if test_set.skip_solver_issue(problem, solver):
-                    failure = (
-                        problem,
-                        solver,
-                        settings,
-                        qpsolvers.Solution(problem),
-                        0.0,
-                    )
-                    results.update(*failure)
-                    if progress_bar is not None:
-                        progress_bar.update(1)
-                    continue
-                if test_set.skip_solver_timeout(
-                    time_limit, problem, solver, settings
-                ):
-                    failure = (
-                        problem,
-                        solver,
-                        settings,
-                        qpsolvers.Solution(problem),
-                        0.0,
-                    )
-                    results.update(*failure)
-                    if progress_bar is not None:
-                        progress_bar.update(1)
-                    continue
-                if verbose:
-                    logging.info(
-                        f"Solving {problem.name} by {solver} "
-                        f"with {settings} settings..."
-                    )
-                kwargs = test_set.solver_settings[settings][solver]
-                solution, runtime = time_solve_problem(
-                    problem, solver, **kwargs
+    problem_tasks = check_problems(
+        test_set,
+        results,
+        filtered_solvers,
+        filtered_settings,
+        only_problem,
+        rerun,
+        rerun_timeouts,
+        progress_bar,
+    )
+
+    for problem, tasks in problem_tasks:
+        for solver, settings in tasks:
+            if verbose:
+                logging.info(
+                    f"Solving {problem.name} by {solver} "
+                    f"with {settings} settings..."
                 )
-                nb_calls += 1
-                nb_calls_since_last_save += 1
-                results.update(problem, solver, settings, solution, runtime)
-                if progress_bar is not None:
-                    progress_bar.update(1)
+            kwargs = test_set.solver_settings[settings][solver]
+            solution, runtime = time_solve_problem(problem, solver, **kwargs)
+            nb_calls += 1
+            nb_calls_since_last_save += 1
+            results.update(problem, solver, settings, solution, runtime)
+            if progress_bar is not None:
+                progress_bar.update(1)
 
         # Save results to file after problem has been fully processed
         if perf_counter() - last_save > 10.0 and nb_calls_since_last_save > 0:
             results.write()
             last_save = perf_counter()
             nb_calls_since_last_save = 0
+
+    if nb_calls_since_last_save > 0:
+        results.write()
 
     duration = perf_counter() - start_counter
     logging.info(f"Ran the test set in {duration:.0f} seconds")

@@ -263,8 +263,7 @@ class Report:
             else ""
         )
         date = str(datetime.datetime.now(datetime.timezone.utc))
-        fh.write(
-            f"""# {self.test_set.title}
+        fh.write(f"""# {self.test_set.title}
 
 | Number of problems | {nb_problems} |
 |:-------------------|:--------------------|
@@ -273,8 +272,7 @@ class Report:
 | CPU                | [{cpu_info_summary}](#cpu-info) |{optional_gpu_line}
 | Run by             | [@{self.author}](https://github.com/{self.author}/) |
 
-"""
-        )
+""")
         fh.write(
             "Benchmark reports are copious as we aim to document "
             "comparison factors as much as possible. You can also "
@@ -290,17 +288,14 @@ class Report:
         fh.write("## Contents\n\n")
         if self.test_set.description is not None:
             fh.write("* [Description](#description)\n")
-        fh.write(
-            """* [Solvers](#solvers)
-* [Results by settings](#results-by-settings)\n"""
-        )
+        fh.write("""* [Solvers](#solvers)
+* [Results by settings](#results-by-settings)\n""")
         for name in self.solver_settings:
             sec_id = name.replace("_", "-") + "-settings"
             fh.write(
                 f"    * [{capitalize_settings(name)} settings](#{sec_id})\n"
             )
-        fh.write(
-            """* [Results by metric](#results-by-metric)
+        fh.write("""* [Results by metric](#results-by-metric)
     * [Success rate](#success-rate)
     * [Computation time](#computation-time)
     * [Optimality conditions](#optimality-conditions)
@@ -309,8 +304,7 @@ class Report:
         * [Duality gap](#duality-gap)
 * [Settings](#settings)
 * [Known limitations](#known-limitations)
-* [CPU info](#cpu-info)\n\n"""
-        )
+* [CPU info](#cpu-info)\n\n""")
 
     def __write_description(self, fh: io.TextIOWrapper) -> None:
         """Write optional Description section.

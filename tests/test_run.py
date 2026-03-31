@@ -67,3 +67,50 @@ class TestRun(unittest.TestCase):
                 rerun=False,
                 rerun_timeouts=False,
             )
+
+    def test_check_problems(self):
+        from qpbenchmark.run import check_problems
+        
+        # Initially, all solvers should be scheduled
+        tasks_generator = check_problems(
+            self.test_set,
+            self.results,
+            list(self.test_set.solvers),
+            list(self.test_set.solver_settings.keys()),
+            only_problem="custom",
+            rerun=False,
+            rerun_timeouts=False,
+            progress_bar=None,
+        )
+        problem_tasks = list(tasks_generator)
+        self.assertEqual(len(problem_tasks), 1)
+        problem, tasks = problem_tasks[0]
+        self.assertEqual(
+            len(tasks),
+            len(self.test_set.solvers) * len(self.test_set.solver_settings)
+        )
+        
+        # Run tests to populate results
+        qpbenchmark.run(
+            self.test_set,
+            self.results,
+            only_problem="custom",
+            only_settings="default",
+            rerun=False,
+            rerun_timeouts=False,
+        )
+        
+        # Running check_problems again should yield no tasks (since results exist and rerun=False)
+        tasks_generator2 = check_problems(
+            self.test_set,
+            self.results,
+            list(self.test_set.solvers),
+            ["default"],
+            only_problem="custom",
+            rerun=False,
+            rerun_timeouts=False,
+            progress_bar=None,
+        )
+        problem_tasks2 = list(tasks_generator2)
+        self.assertEqual(len(problem_tasks2), 0)
+
