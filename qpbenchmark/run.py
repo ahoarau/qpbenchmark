@@ -10,7 +10,7 @@ import multiprocessing
 import os
 import signal
 from time import perf_counter, sleep
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import qpsolvers
 from qpsolvers.exceptions import SolverNotFound
@@ -32,30 +32,39 @@ def _format_runtime(seconds: float) -> str:
         return f"{seconds:.2f}s"
 
 
-def _get_physical_cpu_count() -> int:
-    """Get number of physical CPU cores (not hyperthreaded).
+def _get_cpu_count(enable_hyperthreading: bool = False) -> int:
+    """Get number of CPU cores.
+
+    Note:
+        On modern laptops, CPUs might be divided into performance and 
+        efficiency cores, which can result in different benchmarking 
+        results compared to regular cores and Hyper-Threading.
+
+    Args:
+        enable_hyperthreading: Set to True to count logical cores instead of physical cores.
 
     Returns:
-        Number of physical cores, defaulting to 1 if detection fails.
+        Number of cores, defaulting to 1 if detection fails.
     """
     try:
         import psutil
-        physical = psutil.cpu_count(logical=False) or 1
-        logical = psutil.cpu_count(logical=True) or 1
-        logging.info(
-            f"CPU detection (psutil): {physical} physical cores, "
-            f"{logical} logical cores"
-        )
-        return physical
+        count = psutil.cpu_count(logical=enable_hyperthreading) or 1
+        core_type = "logical" if enable_hyperthreading else "physical"
+        logging.info(f"CPU detection (psutil): {count} {core_type} cores")
+        return count
     except ImportError:
-        # Fallback: estimate as half of logical cores (common for hyperthreading)
         logical = os.cpu_count() or 1
-        physical = max(1, logical // 2)
+        core_type = "logical" if enable_hyperthreading else "physical"
+        if enable_hyperthreading:
+            count = logical
+        else:
+            # Fallback: estimate as half of logical cores (common for hyperthreading)
+            count = max(1, logical // 2)
         logging.info(
-            f"CPU detection (fallback, no psutil): "
-            f"{logical} logical cores -> using {physical} as estimate"
+            f"CPU detection (fallback, no psutil): {logical} logical cores "
+            f"-> using {count} {core_type} cores as estimate"
         )
-        return physical
+        return count
 
 
 def _display_system_info(max_workers: int) -> None:
@@ -167,8 +176,6 @@ def _worker_init():
             except Exception:
                 pass
 
-# that unpicklable C-extension objects inside Solution.extras never cross
-# the process boundary.
 # ---------------------------------------------------------------------------
 
 class _SolveResultProxy:
@@ -288,106 +295,27 @@ def _limit_solver_threads(solver_settings):
                 settings_obj.set_param(solver, "max_threads", 1)
 
 
-def run(
+# ---------------------------------------------------------------------------
+# Core benchmarking routines
+# ---------------------------------------------------------------------------
+
+def _load_problems(
     test_set: TestSet,
-    results: Results,
-    only_problem: Optional[str] = None,
-    only_settings: Optional[str] = None,
-    only_solver: Optional[str] = None,
-    rerun: bool = False,
-    rerun_timeouts: bool = False,
-    verbose: bool = False,
-    max_workers: Optional[int] = None,
-) -> None:
-    """Run a given test set and store results.
-
-    Args:
-        test_set: Test set to run.
-        results: Results instance to write to.
-        only_problem: If set, only run that specific problem in the set.
-        only_settings: If set, only run with these solver settings.
-        only_solver: If set, only run that specific solver.
-        rerun: If set, rerun instances that already have a result.
-        rerun_timeouts: If set, also rerun known timeouts.
-        verbose: If set, log info messages for each QP solver call.
-        max_workers: Maximum number of worker threads for parallel execution.
-            If None (default), uses physical CPU core count for optimal
-            performance in CPU-bound benchmarks. Set to 1 for sequential
-            execution. Problems are processed in parallel while solvers for
-            each problem run sequentially to ensure fair timing.
-    """
-    if only_settings and only_settings not in test_set.solver_settings:
-        raise ValueError(
-            f"settings '{only_settings}' not in the list of settings "
-            f"for this test set: {list(test_set.solver_settings.keys())}"
-        )
-    if only_solver and only_solver not in test_set.solvers:
-        raise SolverNotFound(
-            f"solver '{only_solver}' not in the list of "
-            f"available solvers for this test set: {test_set.solvers}"
-        )
-
-    # Determine number of worker threads (use physical cores by default)
-    if max_workers is None:
-        max_workers = _get_physical_cpu_count()
-
-    # Display system information
-    _display_system_info(max_workers)
-
-    # ------------------------------------------------------------------
-    # Install signal handler early so CTRL+C during Phase 1/2 is clean.
-    # pool_cell[0] is populated once the pool is created in Phase 3.
-    # ------------------------------------------------------------------
-    stop_event = multiprocessing.Event()
-    pool_cell: List = []  # mutable cell so signal handler can reach the pool
-
-    def signal_handler(signum, frame):
-        logging.warning("Received interrupt signal (CTRL+C), stopping...")
-        stop_event.set()
-        if pool_cell:
-            pool_cell[0].terminate()
-
-    original_sigint = signal.signal(signal.SIGINT, signal_handler)
-
-    # Filter solvers and settings based on user preferences
-    filtered_solvers = [
-        solver
-        for solver in test_set.solvers
-        if only_solver is None or solver == only_solver
-    ]
-    filtered_settings = [
-        settings
-        for settings in test_set.solver_settings
-        if only_settings is None or settings == only_settings
-    ]
-
-    logging.info(
-        f"Solvers ({len(filtered_solvers)}): "
-        + ", ".join(sorted(filtered_solvers))
-    )
-    logging.info(
-        f"Settings ({len(filtered_settings)}): "
-        + ", ".join(filtered_settings)
-    )
-
-    # Apply thread limits to solver settings to prevent thread explosion
-    _limit_solver_threads(test_set.solver_settings)
-
-    nb_calls = 0
-    start_counter = perf_counter()
-
-    # ------------------------------------------------------------------
-    # Phase 1 – Load problems (main thread)
-    # ------------------------------------------------------------------
+    only_problem: Optional[str],
+    filtered_solvers: List[str],
+    filtered_settings: List[str],
+    stop_event: multiprocessing.Event,
+) -> Tuple[List, int]:
+    """Load problems from the test set, filtering if requested."""
     logging.info("Loading problems from test set...")
     problems = []
     for problem in test_set:
         if stop_event.is_set():
             logging.warning("Interrupted during problem loading.")
-            signal.signal(signal.SIGINT, original_sigint)
-            return
+            break
         if only_problem is None or problem.name == only_problem:
             problems.append(problem)
+    
     nb_total = len(problems) * len(filtered_solvers) * len(filtered_settings)
     logging.info(
         f"Loaded {len(problems)} problems, "
@@ -395,27 +323,21 @@ def run(
         f"({len(problems)} problems x {len(filtered_solvers)} solvers "
         f"x {len(filtered_settings)} settings)"
     )
+    return problems, nb_total
 
-    # Initialize progress bar
-    progress_bar = None
-    if not verbose:
-        progress_bar = tqdm(
-            total=nb_total,
-            initial=0,
-            position=0,
-            leave=True,
-            dynamic_ncols=True,
-            mininterval=0.1,
-            maxinterval=1.0,
-            smoothing=0.1,
-        )
 
-    # ------------------------------------------------------------------
-    # Phase 2 – Triage tasks on main thread (no threading needed)
-    # ------------------------------------------------------------------
-    # Decide the action for every (problem, solver, settings) combination
-    # and process skips / known failures immediately.  Only actual "solve"
-    # tasks are collected for the thread pool.
+def _triage_tasks(
+    problems: List,
+    filtered_solvers: List[str],
+    filtered_settings: List[str],
+    test_set: TestSet,
+    results: Results,
+    rerun: bool,
+    rerun_timeouts: bool,
+    stop_event: multiprocessing.Event,
+    progress_bar: Optional[tqdm],
+) -> List[Tuple]:
+    """Decide which tasks to skip, report as failed, or actually solve."""
     logging.info("Preparing tasks (checking existing results)...")
     solve_tasks = []
     nb_skip = 0
@@ -431,8 +353,7 @@ def run(
     for problem in problems:
         if stop_event.is_set():
             logging.warning("Interrupted during task triage.")
-            signal.signal(signal.SIGINT, original_sigint)
-            return
+            break
         for solver in filtered_solvers:
             for settings in filtered_settings:
                 time_limit = test_set.tolerances[settings].runtime
@@ -504,18 +425,20 @@ def run(
         f"{nb_record_failure} known failures"
     )
 
-    if not solve_tasks:
-        logging.info("Nothing to solve – all tasks were skipped or failed.")
-        if progress_bar is not None:
-            progress_bar.close()
-        duration = perf_counter() - start_counter
-        logging.info(f"Completed in {duration:.0f} seconds (0 QP solver calls)")
-        return
+    return solve_tasks
 
-    # ------------------------------------------------------------------
-    # Phase 3 – Solve in a process pool (true multiprocessing parallelism)
-    # ------------------------------------------------------------------
-    # _worker_init re-applies BLAS thread limits after fork.
+
+def _execute_tasks(
+    solve_tasks: List[Tuple],
+    test_set: TestSet,
+    results: Results,
+    max_workers: int,
+    verbose: bool,
+    stop_event: multiprocessing.Event,
+    pool_cell: List,
+    progress_bar: Optional[tqdm],
+) -> int:
+    """Execute all solve tasks in a multiprocessing pool."""
     pool = multiprocessing.Pool(processes=max_workers, initializer=_worker_init)
     pool_cell.append(pool)  # expose to signal handler
 
@@ -524,6 +447,7 @@ def run(
     last_status_time = perf_counter()
     last_write_time = perf_counter()
     unsaved_results = 0
+    nb_calls = 0
 
     logging.info(
         f"Launching process pool with {max_workers} workers "
@@ -620,7 +544,7 @@ def run(
                 sleep(0.05)
 
         pool.terminate() if stop_event.is_set() else pool.close()
-        # Wait up to 5 s for workers to exit, then SIGKILL stragglers.
+        # Wait for workers to exit.
         pool.join()
 
     except KeyboardInterrupt:
@@ -631,20 +555,171 @@ def run(
         pool.join()
         logging.warning("Interrupted, stopping gracefully...")
 
-    finally:
-        signal.signal(signal.SIGINT, original_sigint)
-        if progress_bar is not None:
-            progress_bar.close()
-
     # Final safety-net write
     if unsaved_results > 0 or stop_event.is_set():
         logging.info("Writing final results to disk...")
         results.write()
 
-    duration = perf_counter() - start_counter
-    if not stop_event.is_set():
-        logging.info(f"Ran the test set in {duration:.0f} seconds")
-        logging.info(f"Made {nb_calls} QP solver calls")
+    return nb_calls
+
+
+def run(
+    test_set: TestSet,
+    results: Results,
+    only_problem: Optional[str] = None,
+    only_settings: Optional[str] = None,
+    only_solver: Optional[str] = None,
+    rerun: bool = False,
+    rerun_timeouts: bool = False,
+    verbose: bool = False,
+    max_workers: Optional[int] = None,
+    enable_hyperthreading: bool = False,
+) -> None:
+    """Run a given test set and store results.
+
+    Args:
+        test_set: Test set to run.
+        results: Results instance to write to.
+        only_problem: If set, only run that specific problem in the set.
+        only_settings: If set, only run with these solver settings.
+        only_solver: If set, only run that specific solver.
+        rerun: If set, rerun instances that already have a result.
+        rerun_timeouts: If set, also rerun known timeouts.
+        verbose: If set, log info messages for each QP solver call.
+        max_workers: Maximum number of worker threads for parallel execution.
+            If None, uses 1 for sequential execution. If 0, uses physical CPU
+            core count (or logical if enable_hyperthreading is True) for optimal 
+            performance in CPU-bound benchmarks. Problems are processed in 
+            parallel while solvers for each problem run sequentially.
+        enable_hyperthreading: Set to True to count logical cores instead of physical cores.
+    """
+    if only_settings and only_settings not in test_set.solver_settings:
+        raise ValueError(
+            f"settings '{only_settings}' not in the list of settings "
+            f"for this test set: {list(test_set.solver_settings.keys())}"
+        )
+    if only_solver and only_solver not in test_set.solvers:
+        raise SolverNotFound(
+            f"solver '{only_solver}' not in the list of "
+            f"available solvers for this test set: {test_set.solvers}"
+        )
+
+    # Determine number of worker threads
+    if max_workers is None:
+        max_workers = 1
+    elif max_workers == 0:
+        max_workers = _get_cpu_count(enable_hyperthreading)
     else:
-        logging.info(f"Partial run completed in {duration:.0f} seconds")
-        logging.info(f"Made {nb_calls} QP solver calls before interruption")
+        max_workers = max(1, max_workers)
+
+    # Display system information
+    _display_system_info(max_workers)
+
+    # Install signal handler early so CTRL+C is clean.
+    stop_event = multiprocessing.Event()
+    pool_cell: List = []
+
+    def signal_handler(signum, frame):
+        logging.warning("Received interrupt signal (CTRL+C), stopping...")
+        stop_event.set()
+        if pool_cell:
+            pool_cell[0].terminate()
+
+    original_sigint = signal.signal(signal.SIGINT, signal_handler)
+
+    try:
+        # Filter solvers and settings based on user preferences
+        filtered_solvers = [
+            solver
+            for solver in test_set.solvers
+            if only_solver is None or solver == only_solver
+        ]
+        filtered_settings = [
+            settings
+            for settings in test_set.solver_settings
+            if only_settings is None or settings == only_settings
+        ]
+
+        logging.info(
+            f"Solvers ({len(filtered_solvers)}): "
+            + ", ".join(sorted(filtered_solvers))
+        )
+        logging.info(
+            f"Settings ({len(filtered_settings)}): "
+            + ", ".join(filtered_settings)
+        )
+
+        # Apply thread limits to solver settings to prevent thread explosion
+        _limit_solver_threads(test_set.solver_settings)
+
+        start_counter = perf_counter()
+
+        # Phase 1 – Load problems
+        problems, nb_total = _load_problems(
+            test_set, only_problem, filtered_solvers, filtered_settings, stop_event
+        )
+
+        if not problems or stop_event.is_set():
+            return
+
+        # Initialize progress bar
+        progress_bar = None
+        if not verbose:
+            progress_bar = tqdm(
+                total=nb_total,
+                initial=0,
+                position=0,
+                leave=True,
+                dynamic_ncols=True,
+                mininterval=0.1,
+                maxinterval=1.0,
+                smoothing=0.1,
+            )
+
+        try:
+            # Phase 2 – Triage tasks
+            solve_tasks = _triage_tasks(
+                problems,
+                filtered_solvers,
+                filtered_settings,
+                test_set,
+                results,
+                rerun,
+                rerun_timeouts,
+                stop_event,
+                progress_bar,
+            )
+
+            # Phase 3 – Solve
+            if not solve_tasks:
+                logging.info("Nothing to solve – all tasks were skipped or failed.")
+            elif not stop_event.is_set():
+                nb_calls = _execute_tasks(
+                    solve_tasks,
+                    test_set,
+                    results,
+                    max_workers,
+                    verbose,
+                    stop_event,
+                    pool_cell,
+                    progress_bar,
+                )
+            else:
+                nb_calls = 0
+
+            duration = perf_counter() - start_counter
+            if not stop_event.is_set():
+                logging.info(f"Ran the test set in {duration:.0f} seconds")
+                logging.info(f"Made {nb_calls} QP solver calls")
+            else:
+                logging.info(f"Partial run completed in {duration:.0f} seconds")
+                logging.info(f"Made {nb_calls} QP solver calls before interruption")
+                
+        finally:
+            if progress_bar is not None:
+                progress_bar.close()
+
+    finally:
+        # Restore original signal handler
+        signal.signal(signal.SIGINT, original_sigint)
+

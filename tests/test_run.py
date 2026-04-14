@@ -154,7 +154,6 @@ class TestProcessPoolParallelism(unittest.TestCase):
                         "default",
                         {},
                         False,
-                        active_tasks,
                     ),
                 )
                 for i, prob in enumerate(fake_problems)
