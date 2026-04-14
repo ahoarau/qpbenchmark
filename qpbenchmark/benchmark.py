@@ -190,9 +190,15 @@ def parse_command_line_arguments(
     )
     parser_run.add_argument(
         "--max-workers",
-        help="maximum number of parallel worker processes (default: auto-detect CPU count)",
+        help="maximum number of parallel worker processes (0 to auto-detect CPU count, default: 1)",
         type=int,
         default=None,
+    )
+    parser_run.add_argument(
+        "--enable-hyperthreading",
+        default=False,
+        action="store_true",
+        help="count logical instead of physical cores when max-workers is 0 (default: False)",
     )
 
     args = parser.parse_args()
@@ -307,11 +313,11 @@ def main(
             rerun_timeouts=args.rerun_timeouts,
             verbose=args.verbose,
             max_workers=args.max_workers,
+            enable_hyperthreading=args.enable_hyperthreading,
         )
 
     if args.command == "check_problem":
-        problem = test_set.get_problem(args.problem)
-        _ = problem  # dummy variable, to pass ruff linting
+        problem = test_set.get_problem(args.problem)  # noqa: F841
         logging.info(f"Check out `problem` for the {args.problem} problem")
 
     if args.command == "list_problems":
@@ -324,8 +330,7 @@ def main(
 
     if args.command == "check_results":
         logging.info("Check out `results` for the full results data")
-        df = results.df
-        _ = df  # dummy variable, to pass ruff linting
+        df = results.df  # noqa: F841
         logging.info("Check out `df` for results as a pandas DataFrame")
 
     if args.command in ["check_problem", "check_results"]:
