@@ -56,10 +56,15 @@ class Results:
         file_path = Path(path)
         if not file_path.exists():
             return None
+        elif file_path.stat().st_size == 0:
+            logging.warning(
+                "Results file '%s' is empty, treating as if it does not exist.",
+                file_path,
+            )
+            return None
         elif file_path.suffix not in (".csv", ".parquet"):
             raise BenchmarkError(
-                "unknown file extension to read results from "
-                f"in '{file_path}'"
+                f"unknown file extension to read results from in '{file_path}'"
             )
         logging.info("Loading existing results from '%s'...", file_path)
         read_func = (
