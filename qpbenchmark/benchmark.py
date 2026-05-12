@@ -16,6 +16,22 @@ from importlib import import_module  # type: ignore
 from pathlib import Path
 from typing import Optional, Union
 
+# Set thread-limiting environment variables BEFORE importing solver libraries.
+# OpenBLAS, MKL, Rayon and other math backends initialize their thread pools
+# at library load time and only respect these vars if set before import.
+_THREAD_ENV_VARS = {
+    "OMP_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "BLIS_NUM_THREADS": "1",
+    "VECLIB_MAXIMUM_THREADS": "1",
+    "RAYON_NUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS": "1",
+}
+for _var, _val in _THREAD_ENV_VARS.items():
+    if _var not in os.environ:  # don't override user-set values
+        os.environ[_var] = _val
+
 import qpsolvers
 
 from .exceptions import BenchmarkError
@@ -129,7 +145,7 @@ def parse_command_line_arguments(
     )
     parser_report.add_argument(
         "--author",
-        help="author field in the report",
+        help="author field in the report (default: 'qpbenchmark-user')",
     )
 
     # run
@@ -164,7 +180,25 @@ def parse_command_line_arguments(
     )
     parser_run.add_argument(
         "--author",
-        help="author field in the post-run report",
+        help="author field in the post-run report (default: 'qpbenchmark-user')",
+    )
+    parser_run.add_argument(
+        "--limit",
+        help="limit the number of problems to solve (0 means no limit)",
+        type=int,
+        default=0,
+    )
+    parser_run.add_argument(
+        "--max-workers",
+        help="maximum number of parallel worker processes (0 to auto-detect CPU count, default: 1)",
+        type=int,
+        default=None,
+    )
+    parser_run.add_argument(
+        "--enable-hyperthreading",
+        default=False,
+        action="store_true",
+        help="count logical instead of physical cores when max-workers is 0 (default: False)",
     )
 
     args = parser.parse_args()
@@ -208,11 +242,16 @@ def report(args, results: Results, test_set_path: Union[Path, str]):
         test_set_path: Path to the test set Python source.
     """
     logging.info("Writing the overall report...")
-    author = (
-        args.author
-        if args.author
-        else input("GitHub username to write in the report? ")
-    )
+
+    if args.author:
+        author = args.author
+    else:
+        author = "qpbenchmark-user"
+        logging.info(
+            "Using default author 'qpbenchmark-user'. "
+            "Use --author <name> to set a custom author name."
+        )
+
     report = Report(author, results)
     if results.file_path is None:
         raise BenchmarkError("not sure where to save report: no results file")
@@ -246,7 +285,22 @@ def main(
     if args.very_verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     test_set = load_test_set(os.path.abspath(test_set_path))
-    results = Results(results_path or args.results_path, test_set)
+
+    if args.command == "run" and args.limit:
+        test_set.limit = args.limit
+
+    # Set default results path if not provided
+    effective_results_path = results_path or args.results_path
+    if effective_results_path is None:
+        # Create default path: results/<test_set_name>.csv
+        test_set_name = Path(test_set_path).stem
+        test_set_dir = Path(test_set_path).parent
+        results_dir = test_set_dir / "results"
+        results_dir.mkdir(exist_ok=True)
+        effective_results_path = results_dir / f"{test_set_name}.csv"
+        logging.info(f"Using default results file: {effective_results_path}")
+
+    results = Results(effective_results_path, test_set)
 
     if args.command == "run":
         run(
@@ -258,11 +312,12 @@ def main(
             rerun=args.rerun,
             rerun_timeouts=args.rerun_timeouts,
             verbose=args.verbose,
+            max_workers=args.max_workers,
+            enable_hyperthreading=args.enable_hyperthreading,
         )
 
     if args.command == "check_problem":
-        problem = test_set.get_problem(args.problem)
-        _ = problem  # dummy variable, to pass ruff linting
+        problem = test_set.get_problem(args.problem)  # noqa: F841
         logging.info(f"Check out `problem` for the {args.problem} problem")
 
     if args.command == "list_problems":
@@ -275,8 +330,7 @@ def main(
 
     if args.command == "check_results":
         logging.info("Check out `results` for the full results data")
-        df = results.df
-        _ = df  # dummy variable, to pass ruff linting
+        df = results.df  # noqa: F841
         logging.info("Check out `df` for results as a pandas DataFrame")
 
     if args.command in ["check_problem", "check_results"]:

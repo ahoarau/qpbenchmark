@@ -12,6 +12,7 @@ from importlib import metadata
 from typing import Dict
 
 import pandas
+from tqdm import tqdm
 
 from .results import Results
 from .solver_settings import SolverSettings
@@ -234,17 +235,47 @@ class Report:
             ``diff`` of two reports.
         """
         assert path.endswith(".md")
-        self.__compute_dataframes()
-        with open(path, "w", encoding="UTF-8") as fh:
-            self.__write_header(fh)
-            self.__write_toc(fh)
-            self.__write_description(fh)
-            self.__write_solvers_section(fh)
-            self.__write_results_by_settings(fh)
-            self.__write_results_by_metric(fh)
-            self.__write_settings_section(fh)
-            self.__write_limitations_section(fh)
-            self.__write_cpu_info_section(fh)
+        steps = [
+            ("Computing metrics", self.__compute_dataframes),
+            ("Writing header", lambda fh: self.__write_header(fh)),
+            ("Writing TOC", lambda fh: self.__write_toc(fh)),
+            ("Writing description", lambda fh: self.__write_description(fh)),
+            ("Writing solvers", lambda fh: self.__write_solvers_section(fh)),
+            (
+                "Writing results (settings)",
+                lambda fh: self.__write_results_by_settings(fh),
+            ),
+            (
+                "Writing results (metrics)",
+                lambda fh: self.__write_results_by_metric(fh),
+            ),
+            ("Writing settings", lambda fh: self.__write_settings_section(fh)),
+            (
+                "Writing limitations",
+                lambda fh: self.__write_limitations_section(fh),
+            ),
+            ("Writing CPU info", lambda fh: self.__write_cpu_info_section(fh)),
+        ]
+        with tqdm(
+            total=len(steps),
+            desc="Writing report",
+            unit="step",
+            dynamic_ncols=True,
+            leave=True,
+            colour="green",
+            ascii=' >=',
+        ) as bar:
+            # First step has no file handle
+            label, fn = steps[0]
+            bar.set_postfix_str(label, refresh=True)
+            fn()
+            bar.update(1)
+            # Remaining steps write into the file
+            with open(path, "w", encoding="UTF-8") as fh:
+                for label, fn in steps[1:]:
+                    bar.set_postfix_str(label, refresh=True)
+                    fn(fh)
+                    bar.update(1)
         logging.info(f"Wrote report to {path}")
 
     def __write_header(self, fh: io.TextIOWrapper) -> None:
@@ -354,7 +385,7 @@ class Report:
         fh.write("## Settings\n\n")
         fh.write(
             f"There are {len(italics_settings)} settings: "
-            f'{", ".join(italics_settings[:-1])} '
+            f"{', '.join(italics_settings[:-1])} "
             f"and {italics_settings[-1]}. "
             "They validate solutions using the following tolerances:\n\n"
         )
@@ -416,7 +447,7 @@ class Report:
             )
             fh.write(f"### {capitalize_settings(settings)} settings\n\n")
             fh.write(f"{shm_desc}\n\n")
-            fh.write(f'{df.to_markdown(index=True, floatfmt=".1f")}\n\n')
+            fh.write(f"{df.to_markdown(index=True, floatfmt='.1f')}\n\n")
 
     def __write_results_by_metric(self, fh: io.TextIOWrapper) -> None:
         """Write Results by metric.
@@ -474,7 +505,7 @@ class Report:
             "(1.0 is the best):\n\n"
         )
         fh.write(
-            f'{self.__runtime_df.to_markdown(index=True, floatfmt=".1f")}\n\n'
+            f"{self.__runtime_df.to_markdown(index=True, floatfmt='.1f')}\n\n"
         )
 
         comp_times_table_desc = (
@@ -505,7 +536,7 @@ class Report:
             "(1.0 is the best):\n\n"
         )
         fh.write(
-            f'{self.__primal_df.to_markdown(index=True, floatfmt=".1f")}\n\n'
+            f"{self.__primal_df.to_markdown(index=True, floatfmt='.1f')}\n\n"
         )
 
         primal_residual_table_desc = (
@@ -531,11 +562,10 @@ class Report:
 
         fh.write(f"{dual_residual_shm_desc}\n\n")
         fh.write(
-            "Shifted geometric means of dual residuals "
-            "(1.0 is the best):\n\n"
+            "Shifted geometric means of dual residuals (1.0 is the best):\n\n"
         )
         fh.write(
-            f'{self.__dual_df.to_markdown(index=True, floatfmt=".1f")}\n\n'
+            f"{self.__dual_df.to_markdown(index=True, floatfmt='.1f')}\n\n"
         )
 
         dual_residual_table_desc = (
@@ -563,10 +593,10 @@ class Report:
 
         fh.write(f"{duality_gap_shm_desc}\n\n")
         fh.write(
-            "Shifted geometric means of duality gaps " "(1.0 is the best):\n\n"
+            "Shifted geometric means of duality gaps (1.0 is the best):\n\n"
         )
         fh.write(
-            f'{self.__gap_df.to_markdown(index=True, floatfmt=".1f")}\n\n'
+            f"{self.__gap_df.to_markdown(index=True, floatfmt='.1f')}\n\n"
         )
 
         duality_gap_table_desc = (
