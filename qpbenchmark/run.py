@@ -9,27 +9,17 @@
 import multiprocessing
 import os
 import signal
-from time import perf_counter, sleep
+from time import perf_counter
 from typing import List, Optional, Tuple
 
 import qpsolvers
 from qpsolvers.exceptions import SolverNotFound
 from tqdm import tqdm
 
+from .parallel_execution import _execute_tasks
 from .results import Results
 from .spdlog import logging
 from .test_set import TestSet
-from .utils import time_solve_problem
-
-
-def _format_runtime(seconds: float) -> str:
-    """Format a runtime duration with an appropriate unit."""
-    if seconds < 1e-3:
-        return f"{seconds * 1e6:.1f}µs"
-    elif seconds < 1.0:
-        return f"{seconds * 1e3:.1f}ms"
-    else:
-        return f"{seconds:.2f}s"
 
 
 def _get_cpu_count(enable_hyperthreading: bool = False) -> int:
@@ -115,160 +105,6 @@ def _display_system_info(max_workers: int) -> None:
         logging.debug(f"Could not display full system info: {e}")
 
 
-# ---------------------------------------------------------------------------
-# Worker process initializer
-# ---------------------------------------------------------------------------
-
-_THREAD_ENV_VARS = {
-    "OMP_NUM_THREADS": "1",
-    "OPENBLAS_NUM_THREADS": "1",
-    "MKL_NUM_THREADS": "1",
-    "BLIS_NUM_THREADS": "1",
-    "VECLIB_MAXIMUM_THREADS": "1",
-    "RAYON_NUM_THREADS": "1",
-    "NUMEXPR_NUM_THREADS": "1",
-}
-
-
-def _worker_init():
-    """Initializer for every pool worker process.
-
-    After ``fork`` the BLAS libraries (OpenBLAS, MKL, …) reset their
-    internal thread-pool sizes to the machine's core count because the
-    parent's helper threads are dead.  We re-apply the limit here via
-    both environment variables (for any late-initialising libs) and
-    direct ctypes calls (for already-loaded shared objects).
-    """
-    import ctypes
-    import ctypes.util
-
-    # Re-set env vars so any library initialised later in this worker
-    # picks up the right value.
-    for var, val in _THREAD_ENV_VARS.items():
-        os.environ[var] = val
-
-    # Force-limit already-loaded BLAS shared objects via their C API.
-    _BLAS_SETTERS = [
-        # (library glob pattern, function name)
-        ("libopenblas", "openblas_set_num_threads"),
-        ("libmkl_rt", "MKL_Set_Num_Threads"),
-        ("libblis", "bli_thread_set_num_threads"),
-    ]
-    for lib_prefix, func_name in _BLAS_SETTERS:
-        lib_path = ctypes.util.find_library(lib_prefix)
-        if lib_path is None:
-            # Try common suffixes directly
-            import glob
-            candidates = glob.glob(f"/proc/{os.getpid()}/map_files/*")
-            # Walk /proc/self/maps to find the loaded library
-            try:
-                with open("/proc/self/maps") as f:
-                    for line in f:
-                        if lib_prefix in line:
-                            lib_path = line.split()[-1]
-                            break
-            except OSError:
-                pass
-        if lib_path:
-            try:
-                lib = ctypes.CDLL(lib_path)
-                getattr(lib, func_name)(1)
-            except Exception:
-                pass
-
-# ---------------------------------------------------------------------------
-
-class _SolveResultProxy:
-    """Minimal picklable stand-in for qpsolvers.Solution.
-
-    Stores the four scalar fields that ``Results.update`` needs and exposes
-    the same method interface, so no changes to ``results.py`` are required.
-    """
-
-    def __init__(
-        self,
-        found,
-        primal_res: float,
-        dual_res: float,
-        duality_gap_val: float,
-    ):
-        self.found = found
-        self._primal_res = primal_res
-        self._dual_res = dual_res
-        self._duality_gap = duality_gap_val
-
-    def primal_residual(self) -> float:
-        return self._primal_res
-
-    def dual_residual(self) -> float:
-        return self._dual_res
-
-    def duality_gap(self) -> float:
-        return self._duality_gap
-
-
-# ---------------------------------------------------------------------------
-# Solve task – runs inside ProcessPoolExecutor workers
-# ---------------------------------------------------------------------------
-
-def _solve_task(
-    problem,
-    solver: str,
-    settings: str,
-    solver_kwargs: dict,
-    verbose: bool,
-):
-    """Execute a single QP solve.  Called from a process-pool worker.
-
-    Args:
-        problem: The QP problem to solve.
-        solver: Name of the QP solver.
-        settings: Name of the solver settings.
-        solver_kwargs: Keyword arguments for the solver.
-        verbose: If True, log before each solve.
-
-    Returns:
-        Tuple ``(solution, runtime, success)``.
-    """
-    logging.debug(f"Worker {os.getpid()} started: {problem.name}/{solver}/{settings}")
-
-    if verbose:
-        logging.info(
-            f"Solving {problem.name} by {solver} "
-            f"with {settings} settings..."
-        )
-
-    try:
-        solution, runtime = time_solve_problem(
-            problem, solver, **solver_kwargs
-        )
-        # Compute residuals here while the full Solution is still available,
-        # then discard the heavyweight object so only plain scalars cross the
-        # process boundary (avoids pickling failures on C-extension extras).
-        proxy = _SolveResultProxy(
-            found=solution.found,
-            primal_res=solution.primal_residual(),
-            dual_res=solution.dual_residual(),
-            duality_gap_val=solution.duality_gap(),
-        )
-        success = True
-    except Exception as exc:
-        logging.error(
-            f"Unhandled exception solving {problem.name} "
-            f"with {solver}/{settings}: {exc}"
-        )
-        proxy = _SolveResultProxy(
-            found=None,
-            primal_res=float("inf"),
-            dual_res=float("inf"),
-            duality_gap_val=float("inf"),
-        )
-        runtime = 0.0
-        success = False
-
-    return proxy, runtime, success
-
-
 def _limit_solver_threads(solver_settings):
     """Apply thread limits to individual solver parameters.
 
@@ -326,6 +162,33 @@ def _load_problems(
     return problems, nb_total
 
 
+def _resolve_action(
+    key: Tuple,
+    existing_results: dict,
+    time_limit: float,
+    problem,
+    solver: str,
+    settings: str,
+    test_set: TestSet,
+    rerun: bool,
+    rerun_timeouts: bool,
+) -> str:
+    """Return the action string for a single (problem, solver, settings) tuple."""
+    if key not in existing_results:
+        if test_set.skip_solver_issue(problem, solver):
+            return "record_failure"
+        if test_set.skip_solver_timeout(time_limit, problem, solver, settings):
+            return "record_failure"
+        return "solve"
+
+    if not rerun:
+        return "skip"
+    if rerun_timeouts:
+        return "solve"
+    runtime = existing_results[key]
+    return "skip_timeout" if runtime > 0.99 * time_limit else "solve"
+
+
 def _triage_tasks(
     problems: List,
     filtered_solvers: List[str],
@@ -358,46 +221,24 @@ def _triage_tasks(
             for settings in filtered_settings:
                 time_limit = test_set.tolerances[settings].runtime
                 key = (problem.name, solver, settings)
+                action = _resolve_action(
+                    key, existing_results, time_limit,
+                    problem, solver, settings,
+                    test_set, rerun, rerun_timeouts,
+                )
 
-                if key in existing_results:
-                    if not rerun:
-                        action = "skip"
-                    elif not rerun_timeouts:
-                        runtime = existing_results[key]
-                        if runtime > 0.99 * time_limit:
-                            action = "skip_timeout"
-                        else:
-                            action = "solve"
-                    else:
-                        action = "solve"
-                elif test_set.skip_solver_issue(problem, solver):
-                    action = "record_failure"
-                elif test_set.skip_solver_timeout(
-                    time_limit, problem, solver, settings
-                ):
-                    action = "record_failure"
-                else:
-                    action = "solve"
-
-                # Handle non-solve actions immediately on the main thread
                 if action == "skip":
                     nb_skip += 1
                     logging.debug(
                         f"{problem.name} already solved by {solver} "
                         f"with {settings} settings, skipping."
                     )
-                    if progress_bar is not None:
-                        progress_bar.update(1)
-
                 elif action == "skip_timeout":
                     nb_skip_timeout += 1
                     logging.info(
                         f"Skipping {problem.name} / {solver} / "
                         f"{settings} (previous timeout)."
                     )
-                    if progress_bar is not None:
-                        progress_bar.update(1)
-
                 elif action == "record_failure":
                     nb_record_failure += 1
                     solution = qpsolvers.Solution(problem)
@@ -408,11 +249,12 @@ def _triage_tasks(
                         f"Recording failure for "
                         f"{problem.name} / {solver} / {settings}."
                     )
-                    if progress_bar is not None:
-                        progress_bar.update(1)
-
                 elif action == "solve":
                     solve_tasks.append((problem, solver, settings))
+                    continue
+
+                if progress_bar is not None:
+                    progress_bar.update(1)
 
     # Persist any recorded failures in one batch
     if nb_record_failure > 0:
@@ -426,141 +268,6 @@ def _triage_tasks(
     )
 
     return solve_tasks
-
-
-def _execute_tasks(
-    solve_tasks: List[Tuple],
-    test_set: TestSet,
-    results: Results,
-    max_workers: int,
-    verbose: bool,
-    stop_event: multiprocessing.Event,
-    pool_cell: List,
-    progress_bar: Optional[tqdm],
-) -> int:
-    """Execute all solve tasks in a multiprocessing pool."""
-    pool = multiprocessing.Pool(processes=max_workers, initializer=_worker_init)
-    pool_cell.append(pool)  # expose to signal handler
-
-    STATUS_INTERVAL = 4.0   # seconds between periodic status logs
-    WRITE_INTERVAL = 30.0    # seconds between results flushes to disk
-    last_status_time = perf_counter()
-    last_write_time = perf_counter()
-    unsaved_results = 0
-    nb_calls = 0
-
-    logging.info(
-        f"Launching process pool with {max_workers} workers "
-        f"for {len(solve_tasks)} solve tasks..."
-    )
-
-    try:
-        # Submit all solve tasks up front.
-        pending = [
-            (
-                pool.apply_async(
-                    _solve_task,
-                    args=(
-                        problem,
-                        solver,
-                        settings,
-                        test_set.solver_settings[settings][solver],
-                        verbose,
-                    ),
-                ),
-                problem,
-                solver,
-                settings,
-            )
-            for problem, solver, settings in solve_tasks
-        ]
-        pool.close()  # no more tasks will be submitted
-
-        # Collect results on the main process.
-        while pending and not stop_event.is_set():
-            still_pending = []
-            newly_done = []
-            for ar, problem, solver, settings in pending:
-                if ar.ready():
-                    newly_done.append((ar, problem, solver, settings))
-                else:
-                    still_pending.append((ar, problem, solver, settings))
-
-            for ar, problem, solver, settings in newly_done:
-                try:
-                    solution, runtime, success = ar.get()
-                except Exception as exc:
-                    logging.error(
-                        f"Unexpected error collecting result for "
-                        f"{problem.name}/{solver}/{settings}: {exc}"
-                    )
-                    solution = _SolveResultProxy(
-                        found=None,
-                        primal_res=float("inf"),
-                        dual_res=float("inf"),
-                        duality_gap_val=float("inf"),
-                    )
-                    runtime = 0.0
-                    success = False
-
-                if success:
-                    nb_calls += 1
-                logging.info(
-                    f"{'Solved' if success else 'Failed'} "
-                    f"{problem.name} / {solver} / {settings} "
-                    f"in {_format_runtime(runtime)} "
-                    f"(found={solution.found})"
-                )
-                results.update(
-                    problem, solver, settings, solution, runtime
-                )
-                unsaved_results += 1
-                if perf_counter() - last_write_time >= WRITE_INTERVAL:
-                    results.write()
-                    last_write_time = perf_counter()
-                    unsaved_results = 0
-                if progress_bar is not None:
-                    progress_bar.update(1)
-
-            pending = still_pending
-
-            # Periodic status log
-            now = perf_counter()
-            if now - last_status_time >= STATUS_INTERVAL:
-                n_done = len(solve_tasks) - len(still_pending)
-                n_in_flight = len(still_pending)
-                if n_in_flight > 0:
-                    logging.info(
-                        f"Progress: {n_done}/{len(solve_tasks)} solves done, "
-                        f"{n_in_flight} in flight"
-                    )
-                last_status_time = now
-
-            if progress_bar is not None:
-                progress_bar.refresh()
-
-            # Avoid busy-waiting when all in-flight tasks are still running.
-            if not newly_done:
-                sleep(0.05)
-
-        pool.terminate() if stop_event.is_set() else pool.close()
-        # Wait for workers to exit.
-        pool.join()
-
-    except KeyboardInterrupt:
-        # Shouldn't normally reach here (signal handler fires first),
-        # but handle it defensively.
-        stop_event.set()
-        pool.terminate()
-        pool.join()
-        logging.warning("Interrupted, stopping gracefully...")
-
-    # Final safety-net write
-    if unsaved_results > 0 or stop_event.is_set():
-        logging.info("Writing final results to disk...")
-        results.write()
-
-    return nb_calls
 
 
 def run(
@@ -623,7 +330,10 @@ def run(
         logging.warning("Received interrupt signal (CTRL+C), stopping...")
         stop_event.set()
         if pool_cell:
-            pool_cell[0].terminate()
+            try:
+                pool_cell[0].shutdown(wait=False)
+            except Exception:
+                pass
 
     original_sigint = signal.signal(signal.SIGINT, signal_handler)
 
