@@ -17,7 +17,7 @@ from qpsolvers import SolverNotFound, available_solvers
 
 import qpbenchmark
 from qpbenchmark import Results
-from qpbenchmark.run import _solve_task
+from qpbenchmark.parallel_execution import _solve_task
 
 from .custom_test_set import CustomTestSet
 
@@ -121,13 +121,11 @@ class TestProcessPoolParallelism(unittest.TestCase):
 
         import qpsolvers
 
-        fake_test_set = _FakeTestSet()
         fake_problems = [
             self._fake_problem(f"problem_{i}") for i in range(self.num_tasks)
         ]
 
         manager = multiprocessing.Manager()
-        active_tasks = manager.dict()
 
         # Use a manager list to collect (problem_name, pid) pairs
         # across processes (inherited via fork).
@@ -139,12 +137,19 @@ class TestProcessPoolParallelism(unittest.TestCase):
             time.sleep(self.task_delay)
             return qpsolvers.Solution(problem), self.task_delay
 
-        run_module = sys.modules["qpbenchmark.run"]
+        execution_module = sys.modules["qpbenchmark.parallel_execution"]
 
-        with patch.object(run_module, "time_solve_problem", slow_solve):
+        with patch.object(
+            execution_module, "time_solve_problem", slow_solve
+        ):
             start = time.perf_counter()
 
-            pool = multiprocessing.Pool(processes=self.num_workers)
+            try:
+                mp_context = multiprocessing.get_context("fork")
+            except ValueError:
+                mp_context = multiprocessing.get_context()
+
+            pool = mp_context.Pool(processes=self.num_workers)
             async_results = [
                 pool.apply_async(
                     _solve_task,
@@ -160,7 +165,7 @@ class TestProcessPoolParallelism(unittest.TestCase):
             ]
             pool.close()
             for ar in async_results:
-                ar.get()  # propagate exceptions
+                ar.get()
             pool.join()
 
             elapsed = time.perf_counter() - start
@@ -257,63 +262,32 @@ class PerformanceTestSet(qpbenchmark.TestSet):
 
 
 class TestPerformance(unittest.TestCase):
-    def test_parallel_speedup(self):
+    def test_parallel_correctness(self):
         """
-        Verify that parallel execution provides expected speedup.
-        Simulate a slow computation (sleep 1s) with 10 records.
+        Verify that parallel execution (max_workers > 1) produces correct results.
+
+        Timing-based parallelism is already proven by
+        TestProcessPoolParallelism.test_workers_run_in_parallel.  Here we only
+        check that run() with multiple workers completes and records every
+        expected result — without relying on fork-propagated monkeypatches that
+        would deadlock on macOS.
         """
-        from unittest.mock import patch
-
-        import qpsolvers
-
-        num_records = 10
-        sleep_time = 1.0  # seconds
-
+        num_records = 4
         test_set = PerformanceTestSet(num_records)
         csv_path = tempfile.mktemp(".csv")
         results = Results(file_path=csv_path, test_set=test_set)
 
-        def slow_solve(problem, solver, **kwargs):
-            time.sleep(sleep_time)
-            # Return a valid solution object and runtime
-            return qpsolvers.Solution(problem), sleep_time
+        qpbenchmark.run(
+            test_set,
+            results,
+            only_settings="default",
+            only_solver="daqp",
+            max_workers=4,
+            verbose=False,
+        )
 
-        # Patch time_solve_problem where it is imported in run.py
-        with patch(
-            "qpbenchmark.run.time_solve_problem", side_effect=slow_solve
-        ):
-
-            # 1. Test sequential (max_workers=1)
-            # This should take ~10 seconds
-            start_seq = time.perf_counter()
-            qpbenchmark.run(
-                test_set,
-                results,
-                only_settings="default",
-                only_solver="daqp",
-                max_workers=1,
-                verbose=False,
-            )
-            duration_seq = time.perf_counter() - start_seq
-
-            # 2. Test parallel (max_workers=16)
-            # This should take ~1 second
-            start_par = time.perf_counter()
-            qpbenchmark.run(
-                test_set,
-                results,
-                only_settings="default",
-                only_solver="daqp",
-                max_workers=16,
-                rerun=True,
-                verbose=False,
-            )
-            duration_par = time.perf_counter() - start_par
-
-        # Assertions
-        # Sequential: ~10s
-        self.assertGreaterEqual(duration_seq, num_records * sleep_time * 0.95)
-
-        # Parallel: ~1s
-        # Allow up to 3.5s to account for process startup/shutdown overhead
-        self.assertLess(duration_par, 3.5 * sleep_time)
+        self.assertEqual(
+            len(results.df),
+            num_records,
+            f"Expected {num_records} results, got {len(results.df)}",
+        )
