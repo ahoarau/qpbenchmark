@@ -4,6 +4,7 @@ build-backend = "flit_core.buildapi"
 
 [project]
 name = "qpbenchmark"
+version = "2.5.0"
 readme = "README.md"
 authors = [
     {name = "Stéphane Caron", email = "stephane.caron@normalesup.org"},
@@ -11,7 +12,7 @@ authors = [
 maintainers = [
     {name = "Stéphane Caron", email = "stephane.caron@normalesup.org"},
 ]
-dynamic = ['version', 'description']
+dynamic = ['description']
 requires-python = ">=3.9"
 classifiers = [
     "Development Status :: 5 - Production/Stable",
