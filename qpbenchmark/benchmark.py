@@ -23,6 +23,7 @@ from .plot_metric import plot_metric
 from .report import Report
 from .results import Results
 from .run import run
+from .run_mth import run_mth
 from .spdlog import logging
 from .test_set import TestSet
 
@@ -166,6 +167,15 @@ def parse_command_line_arguments(
         "--author",
         help="author field in the post-run report",
     )
+    parser_run.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        help=(
+            "number of parallel worker processes "
+            "(0 = auto-detect physical cores; default = sequential)"
+        ),
+    )
 
     args = parser.parse_args()
     if "settings" in args and args.settings is not None:
@@ -249,16 +259,34 @@ def main(
     results = Results(results_path or args.results_path, test_set)
 
     if args.command == "run":
-        run(
-            test_set,
-            results,
-            only_problem=args.problem,
-            only_settings=args.settings,
-            only_solver=args.solver,
-            rerun=args.rerun,
-            rerun_timeouts=args.rerun_timeouts,
-            verbose=args.verbose,
-        )
+        max_workers = getattr(args, "max_workers", None)
+        if max_workers is not None and max_workers != 1:
+            if args.rerun or args.rerun_timeouts:
+                logging.warning(
+                    "Ignoring --rerun/--rerun-timeouts with --max-workers; "
+                    "rerun is only supported in sequential mode "
+                    "(--max-workers 1)."
+                )
+            run_mth(
+                test_set,
+                results,
+                only_problem=args.problem,
+                only_settings=args.settings,
+                only_solver=args.solver,
+                verbose=args.verbose,
+                max_workers=max_workers,
+            )
+        else:
+            run(
+                test_set,
+                results,
+                only_problem=args.problem,
+                only_settings=args.settings,
+                only_solver=args.solver,
+                rerun=args.rerun,
+                rerun_timeouts=args.rerun_timeouts,
+                verbose=args.verbose,
+            )
 
     if args.command == "check_problem":
         problem = test_set.get_problem(args.problem)

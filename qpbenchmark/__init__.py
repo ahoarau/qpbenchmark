@@ -13,6 +13,7 @@ from .problem_list import ProblemList
 from .report import Report
 from .results import Results
 from .run import run
+from .run_mth import run_mth
 from .spdlog import logging
 from .test_set import TestSet
 from .tolerance import Tolerance
@@ -33,4 +34,5 @@ __all__ = [
     "Tolerance",
     "logging",
     "run",
+    "run_mth",
 ]

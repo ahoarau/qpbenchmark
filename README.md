@@ -113,6 +113,32 @@ qpbenchmark my_test_set.py run --solver proxqp --settings default
 
 Check out ``qpbenchmark --help`` for a list of available commands and arguments.
 
+### Parallel execution
+
+The ``run`` command accepts a ``--max-workers`` argument to solve problems in parallel across multiple worker processes:
+
+```console
+qpbenchmark my_test_set.py run --max-workers 0
+```
+
+Setting ``--max-workers 0`` auto-detects the number of physical CPU cores and uses one worker per core. You can also pass an explicit count:
+
+```console
+qpbenchmark my_test_set.py run --max-workers 4
+```
+
+Each worker process is restricted to a single BLAS/OpenMP thread to prevent thread explosion when solvers themselves use multithreading. The default (no ``--max-workers`` flag, or ``--max-workers 1``) runs sequentially, identical to the previous behaviour.
+
+Internally, solve calls are grouped into small task chunks before being submitted to worker processes, which helps reduce inter-process communication overhead on larger runs.
+
+The programmatic equivalent is the ``run_mth`` function, which is a drop-in companion to ``run``:
+
+```python
+from qpbenchmark import run_mth
+
+run_mth(test_set, results, max_workers=0)
+```
+
 ### Plots
 
 The command line ships a ``plot`` command to compare solver performances over a test set for a specific metric. For instance, run:
