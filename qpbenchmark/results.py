@@ -54,7 +54,7 @@ class Results:
             Loaded dataframe, or None if the file does not exist.
         """
         file_path = Path(path)
-        if not file_path.exists():
+        if not file_path.exists() or file_path.stat().st_size == 0:
             return None
         elif file_path.suffix not in (".csv", ".parquet"):
             raise BenchmarkError(
